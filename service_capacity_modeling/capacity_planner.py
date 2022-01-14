@@ -2,6 +2,7 @@
 import functools
 import logging
 from hashlib import blake2b
+from multiprocessing import Pool, cpu_count
 from typing import Any
 from typing import Callable
 from typing import Dict
@@ -427,38 +428,17 @@ class CapacityPlanner:
         zonal_requirements: Dict[str, Dict] = {}
         regional_requirements: Dict[str, Dict] = {}
 
-        regret_clusters_by_model: Dict[
-            str, Sequence[Tuple[CapacityPlan, CapacityDesires, float]]
-        ] = {}
-        for sub_model, sub_desires in self._sub_models(
-            model_name=model_name,
-            desires=desires,
-            extra_model_arguments=extra_model_arguments,
-        ):
-            model_plans: List[Tuple[CapacityDesires, Sequence[CapacityPlan]]] = []
-            for sim_desires in model_desires(sub_desires, simulations):
-                model_plans.append(
-                    (
-                        sim_desires,
-                        self._plan_certain(
-                            model_name=sub_model,
-                            region=region,
-                            desires=sim_desires,
-                            num_results=1,
-                            extra_model_arguments=extra_model_arguments,
-                            lifecycles=lifecycles,
-                            instance_families=instance_families,
-                            drives=drives,
-                        ),
-                    )
-                )
-            regret_clusters_by_model[sub_model] = _regret(
-                capacity_plans=[
-                    (sim_desires, plan[0]) for sim_desires, plan in model_plans if plan
-                ],
-                regret_params=regret_params,
-                model=self._models[sub_model],
-            )
+        regret_clusters_by_model = self._simulations(
+            desires,
+            extra_model_arguments,
+            model_name,
+            region,
+            regret_params,
+            simulations,
+            lifecycles,
+            instance_families,
+            drives
+        )
 
         # Now accumulate across the composed models and return the top N
         # by distinct hardware type
@@ -540,6 +520,64 @@ class CapacityPlanner:
             result.explanation.context["regret"] = least_regret
 
         return result
+
+    def _simulations(
+        self,
+        desires,
+        extra_model_arguments,
+        model_name,
+        region,
+        regret_params,
+        simulations,
+        lifecycles,
+        instance_families,
+        drives,
+    ):
+        regret_clusters_by_model: Dict[
+            str, Sequence[Tuple[CapacityPlan, CapacityDesires, float]]
+        ] = {}
+
+        with Pool() as pool:
+            for sub_model, sub_desires in self._sub_models(
+                model_name=model_name,
+                desires=desires,
+                extra_model_arguments=extra_model_arguments,
+            ):
+                model_plans: List[Tuple[CapacityDesires, Sequence[CapacityPlan]]] = []
+                kwargs = [
+                    {
+                        "model_name": sub_model,
+                        "region": region,
+                        "desires": sim_desires,
+                        "num_results": 1,
+                        "extra_model_arguments": extra_model_arguments,
+                        "lifecycles": lifecycles,
+                        "instance_families": instance_families,
+                        "drives": drives,
+                    }
+                    for sim_desires in model_desires(sub_desires, simulations)
+                ]
+                model_plans.extend(
+                    pool.imap_unordered(
+                        self._simulation,
+                        kwargs,
+                        chunksize=1 + simulations // cpu_count(),
+                    )
+                )
+
+                regret_clusters_by_model[sub_model] = _regret(
+                    capacity_plans=[
+                        (sim_desires, plan[0])
+                        for sim_desires, plan in model_plans
+                        if plan
+                    ],
+                    regret_params=regret_params,
+                    model=self._models[sub_model],
+                )
+        return regret_clusters_by_model
+
+    def _simulation(self, kwargs):
+        return kwargs["desires"], self._plan_certain(**kwargs)
 
     def _sub_models(
         self,
